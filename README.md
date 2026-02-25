@@ -3,6 +3,7 @@ We build a fully bidirectional, delta-neutral carry strategy on crypto perpetual
 
 
 # Proposed Structure 
+```
 Crypto-PerpetualFutures/
 │
 ├── data/
@@ -30,4 +31,5 @@ Crypto-PerpetualFutures/
 │   └── build_panel.py       # merges everything → master_panel
 │
 ├── strategy.py              # importable trading logic
-└── notebook.ipynb           # research notebook
+└── notebook.ipynb           # research notebook 
+```
