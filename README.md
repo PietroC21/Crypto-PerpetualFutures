@@ -2,7 +2,41 @@
 We build a fully bidirectional, delta-neutral carry strategy on crypto perpetual futures. We harvest funding rate dislocations in both directions across 15 liquid pairs, using a z-score signal that identifies anomalies relative to each asset's own funding history.
 
 
-# Proposed Structure 
+# Get Started
+
+### 1. Create and activate the conda environment
+
+```bash
+conda create -n qts-perp python=3.11 -y
+conda activate qts-perp
+pip install ccxt pandas pyarrow requests tqdm
+```
+
+### 2. Select the interpreter in VSCode
+
+`Cmd+Shift+P` → **Python: Select Interpreter** → pick `qts-perp`
+
+### 3. Connect VPN (required from US IPs)
+
+Binance blocks US-based IPs (HTTP 451). Connect your VPN to a non-US server before running any data fetch.
+
+### 4. Fetch Binance data
+
+```bash
+# Test pull — BTC + ETH, last year only
+python src/fetch_binance.py --symbols BTC ETH --start 2024-01-01
+
+# Full pull — all 15 pairs, Jan 2020 → today (~30 min)
+python src/fetch_binance.py
+```
+
+Output lands in `data/raw/binance/` as Parquet files (one per symbol per series).
+Re-running is safe — the script resumes from the last saved timestamp.
+
+---
+
+# Proposed Structure
+
 ```
 Crypto-PerpetualFutures/
 │
