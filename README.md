@@ -20,14 +20,14 @@ Crypto-PerpetualFutures/
 │   │       └── spy_intraday.parquet # 5-day rolling drawdown source
 │   │
 │   └── processed/
-│       └── master_panel.parquet     # single clean merged dataset
+│       └── master_panel.parquet     # clean merged dataset
 │
 ├── src/
-│   ├── fetch_binance.py     # ccxt: funding rates, OI, OHLCV
-│   ├── fetch_macro.py       # Bloomberg blpapi + FRED
+│   ├── fetch_binance.py     # funding rates, OI, OHLCV
+│   ├── fetch_macro.py       # Bloomberg + FRED
 │   ├── fetch_databento.py   # Databento SDK
-│   ├── validate.py          # gap checks, sanity assertions
+│   ├── validate.py          # data checks & assertions
 │   └── build_panel.py       # merges everything → master_panel
 │
-├── strategy.py              # importable module (Person C's deliverable)
-└── notebook.ipynb           # imports from src/ and data/processed/ only
+├── strategy.py              # importable trading logic
+└── notebook.ipynb           # research notebook
