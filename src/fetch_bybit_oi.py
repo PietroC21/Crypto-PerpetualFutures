@@ -47,7 +47,8 @@ UNIVERSE = [
 DEFAULT_START = "2020-12-01"   # Bybit USDT perps launched ~late 2020; no data before this
 BYBIT_OI_URL  = "https://api.bybit.com/v5/market/open-interest"
 LIMIT         = 200            # Bybit max per request
-SLEEP_S       = 0.15           # ~6 req/s — well under Bybit public rate limits
+SLEEP_S          = 0.15  # sleep between paginated requests within a symbol
+SLEEP_SYMBOL_S   = 5.0   # sleep between symbols — prevents Bybit IP rate-limiting on long runs
 
 
 # ---------------------------------------------------------------------------
@@ -144,19 +145,30 @@ def run(symbols: list[str], start: str, end: str | None) -> None:
 
     print(f"Fetching OI from Bybit | {start} → {end or 'now'} | {len(symbols)} symbols\n")
 
-    for symbol in tqdm(symbols, desc="OI"):
+    for i, symbol in enumerate(tqdm(symbols, desc="OI")):
         out = OUT_DIR / f"{symbol}.parquet"
 
         if out.exists():
-            existing = pd.read_parquet(out)
-            last_ms  = int(existing.index.max().timestamp() * 1000) + 1
-            print(f"  [{symbol}] resuming from {existing.index.max().date()}")
-            df_new = fetch_oi(symbol, last_ms, end_ms)
-            if not df_new.empty:
-                df = pd.concat([existing, df_new])
-                df = df[~df.index.duplicated(keep="first")].sort_index()
+            existing  = pd.read_parquet(out)
+            earliest  = int(existing.index.min().timestamp() * 1000)
+            latest_ms = int(existing.index.max().timestamp() * 1000) + 1
+
+            needs_backfill = earliest > start_ms + 24 * 3600 * 1000  # >1 day gap at start
+
+            if needs_backfill:
+                # File is partial — missing early history, re-pull from scratch
+                print(f"  [{symbol}] partial file (starts {existing.index.min().date()}) — re-pulling from {start}")
+                df = fetch_oi(symbol, start_ms, end_ms)
+                if not df.empty:
+                    # Merge to keep whichever data we have
+                    df = pd.concat([existing, df])
+                    df = df[~df.index.duplicated(keep="first")].sort_index()
             else:
-                df = existing
+                # File is complete — just append new data at the top
+                print(f"  [{symbol}] resuming from {existing.index.max().date()}")
+                df_new = fetch_oi(symbol, latest_ms, end_ms)
+                df = pd.concat([existing, df_new]) if not df_new.empty else existing
+                df = df[~df.index.duplicated(keep="first")].sort_index()
         else:
             df = fetch_oi(symbol, start_ms, end_ms)
 
@@ -168,6 +180,10 @@ def run(symbols: list[str], start: str, end: str | None) -> None:
             print(f"  [{symbol}] no data returned — symbol may not have existed yet")
 
         print()
+
+        # Sleep between symbols to avoid Bybit rate-limiting on long runs
+        if i < len(symbols) - 1:
+            time.sleep(SLEEP_SYMBOL_S)
 
     print("Done. OI files saved to data/raw/binance/open_interest/")
 

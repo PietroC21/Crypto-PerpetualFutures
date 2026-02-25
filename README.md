@@ -33,6 +33,20 @@ python src/fetch_binance.py
 Output lands in `data/raw/binance/` as Parquet files (one per symbol per series).
 Re-running is safe — the script resumes from the last saved timestamp.
 
+### 5. Fetch Open Interest (Bybit — no VPN needed)
+
+Binance's OI endpoint is capped at ~30 days. Bybit provides free OI history back to Dec 2020.
+
+```bash
+# Full pull — all 15 pairs (~30-45 min)
+python src/fetch_bybit_oi.py
+
+# Subset
+python src/fetch_bybit_oi.py --symbols BTC ETH SOL
+```
+
+Output lands in `data/raw/binance/open_interest/` — same directory as the rest.
+
 ---
 
 # Proposed Structure
