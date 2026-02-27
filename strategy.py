@@ -33,8 +33,12 @@ Usage
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+OB_DATA_DIR = Path(__file__).resolve().parent / "data" / "raw" / "binance" / "order_book"
 
 # ---------------------------------------------------------------------------
 # Default parameters
@@ -49,9 +53,24 @@ DEFAULTS: dict = {
     "spy_dd_window":  15,    # periods for SPY drawdown look-back (15 × 8h = 5 days)
     "spy_dd_gate":    0.05,  # SPY drawdown threshold (5%)
     "taker_fee":      0.0004,# Binance taker fee per side (4 bps)
+    "universe":       None,  # None → use module-level UNIVERSE list
+    "obi_threshold":  0.0,   # min |OBI| alignment required (0 = any directional match)
+    "use_obi":        True,  # set False to disable OBI filter entirely
 }
 
 PERIODS_PER_YEAR: int = 3 * 365  # 8h periods in a year
+
+# Top 7 by Binance perp liquidity (volume + OI). Master panel has all 15;
+# we filter here so the panel rebuild is never needed when changing the universe.
+UNIVERSE: list[str] = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +137,62 @@ def oi_filter(
 
 
 # ---------------------------------------------------------------------------
+# Filter: order book imbalance confirmation
+# ---------------------------------------------------------------------------
+
+def obi_filter(
+    zscore: pd.DataFrame,
+    obi: pd.DataFrame,
+    z_entry: float,
+    threshold: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Boolean mask: True when the order book direction confirms the funding signal.
+
+    Logic (per symbol, per period):
+      SHORT candidate  (z > +z_entry, position = −1):
+          Require OBI > +threshold — bid-heavy book means longs are dominant,
+          they will keep paying positive funding → signal is likely to persist.
+      LONG candidate   (z < −z_entry, position = +1):
+          Require OBI < −threshold — ask-heavy book means shorts are dominant,
+          they will keep paying negative funding → signal is likely to persist.
+      Flat (|z| ≤ z_entry): filter not applied (always True).
+      Missing OBI data: defaults to True (no spurious blocks).
+
+    Mathematically the condition simplifies to:
+        (raw_direction × OBI) < −threshold
+
+    Parameters
+    ----------
+    zscore    : pd.DataFrame, shape (T, N)
+    obi       : pd.DataFrame, shape (T, N)  — order book imbalance [−1, +1]
+    z_entry   : float
+    threshold : float  — minimum |OBI| required for confirmation (default 0)
+
+    Returns
+    -------
+    pd.DataFrame of bool, same shape as zscore.
+    """
+    # Raw signal direction: −1 (SHORT), +1 (LONG), 0 (flat)
+    direction = pd.DataFrame(0.0, index=zscore.index, columns=zscore.columns)
+    direction[zscore >  z_entry] = -1.0
+    direction[zscore < -z_entry] =  1.0
+
+    obi_aligned = obi.reindex_like(direction)
+
+    # Confirmed when direction × OBI < −threshold (opposite signs, magnitude check)
+    confirmed = (direction * obi_aligned) < -threshold
+
+    # Flat positions: filter irrelevant — always allow
+    confirmed = confirmed | (direction == 0)
+
+    # Missing OBI: default to True (no data → no block)
+    confirmed = confirmed | obi_aligned.isna()
+
+    return confirmed
+
+
+# ---------------------------------------------------------------------------
 # Gate: macro risk filter
 # ---------------------------------------------------------------------------
 
@@ -169,6 +244,7 @@ def compute_positions(
     oi_mask: pd.DataFrame,
     risk_on: pd.Series,
     z_entry: float,
+    obi_mask: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Compute equal-weight positions across active signals.
@@ -178,15 +254,16 @@ def compute_positions(
       z < −z_entry  →  raw = +1  (LONG:  collect negative/depressed funding)
       else          →  raw =  0  (flat)
 
-    Active = raw != 0 AND oi_mask AND risk_on.
+    Active = raw != 0 AND oi_mask AND risk_on AND obi_mask (if provided).
     Each active position sized at 1 / (number of active positions in that period).
 
     Parameters
     ----------
-    zscore : pd.DataFrame, shape (T, N)
-    oi_mask : pd.DataFrame, shape (T, N)  — bool
-    risk_on : pd.Series, shape (T,)       — bool
-    z_entry : float
+    zscore   : pd.DataFrame, shape (T, N)
+    oi_mask  : pd.DataFrame, shape (T, N)  — bool, OI liquidity gate
+    risk_on  : pd.Series, shape (T,)       — bool, macro gate
+    z_entry  : float
+    obi_mask : pd.DataFrame | None         — bool, OBI confirmation filter (optional)
 
     Returns
     -------
@@ -197,8 +274,12 @@ def compute_positions(
     raw[zscore >  z_entry] = -1.0
     raw[zscore < -z_entry] =  1.0
 
-    # Apply liquidity filter
+    # Apply OI liquidity filter
     raw = raw * oi_mask.reindex_like(raw).fillna(True).astype(float)
+
+    # Apply OBI confirmation filter (if available)
+    if obi_mask is not None:
+        raw = raw * obi_mask.reindex_like(raw).fillna(True).astype(float)
 
     # Apply macro gate (broadcast across symbols)
     raw = raw.multiply(risk_on.reindex(raw.index).fillna(True).astype(float), axis=0)
@@ -372,6 +453,10 @@ def run_backtest(panel: pd.DataFrame, **kwargs) -> dict:
     """
     params = {**DEFAULTS, **kwargs}
 
+    # --- Filter to universe ---
+    universe = params["universe"] or UNIVERSE
+    panel = panel[panel.index.get_level_values("symbol").isin(universe)]
+
     # --- Unstack to wide format (T × N) ---
     funding = panel["funding_rate"].unstack("symbol")
     oi      = panel["open_interest"].unstack("symbol")
@@ -393,8 +478,27 @@ def run_backtest(panel: pd.DataFrame, **kwargs) -> dict:
         params["spy_dd_gate"],
     )
 
+    # --- OBI confirmation filter (optional: only active if files exist) ---
+    obi_wide  = None
+    obi_mask  = None
+    if params["use_obi"]:
+        ob_cols = {}
+        for sym in universe:
+            path = OB_DATA_DIR / f"{sym}.parquet"
+            if path.exists():
+                ob_cols[sym] = pd.read_parquet(path)["obi"]
+        if ob_cols:
+            obi_wide = pd.DataFrame(ob_cols).reindex(funding.index)
+            obi_mask = obi_filter(
+                zscore, obi_wide,
+                params["z_entry"],
+                params["obi_threshold"],
+            )
+
     # --- Positions ---
-    positions = compute_positions(zscore, oi_mask, risk_on, params["z_entry"])
+    positions = compute_positions(
+        zscore, oi_mask, risk_on, params["z_entry"], obi_mask
+    )
 
     # --- P&L ---
     pnl_df = compute_pnl(positions, funding, rfr, params["taker_fee"])
@@ -409,9 +513,23 @@ def run_backtest(panel: pd.DataFrame, **kwargs) -> dict:
         "params":      params,
         "zscore":      zscore,
         "oi_mask":     oi_mask,
+        "obi":         obi_wide,   # raw OBI values (T, N), None if no files loaded
+        "obi_mask":    obi_mask,   # bool confirmation mask (T, N), None if disabled
         "risk_on":     risk_on,
         "positions":   positions,
         "pnl":         pnl_df,
         "metrics":     metrics,
         "cum_returns": cum_returns,
     }
+
+
+'''
+# With OBI (after running fetch_ob.py)
+result = run_backtest(panel)
+
+# Disable OBI to compare
+result_no_obi = run_backtest(panel, use_obi=False)
+
+# Stricter OBI threshold
+result_strict = run_backtest(panel, obi_threshold=0.1)
+'''
