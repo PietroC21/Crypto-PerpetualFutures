@@ -403,8 +403,6 @@ if __name__ == "__main__":
     assets = [args.asset] if args.asset else UNIVERSE_HL
     start_slug = args.start[:10]
     end_slug   = args.end[:10]
-    out_dir    = Path("data")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     failed = []
     for asset in assets:
@@ -415,6 +413,9 @@ if __name__ == "__main__":
                 end_date=args.end,
                 spread_bps=args.spread,
             )
+            # Save into per-currency folder: data/{ASSET}/hyperliquid_{ASSET}_...parquet
+            out_dir = Path("data") / asset
+            out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / f"hyperliquid_{asset}_{start_slug}_{end_slug}.parquet"
             df.to_parquet(out_path)
             print(f"Saved → {out_path}\n")
@@ -425,4 +426,4 @@ if __name__ == "__main__":
     if failed:
         print(f"\nFailed assets: {failed}")
     else:
-        print(f"\nAll {len(assets)} assets saved to {out_dir}/")
+        print(f"\nAll {len(assets)} assets saved to data/{{ASSET}}/")
