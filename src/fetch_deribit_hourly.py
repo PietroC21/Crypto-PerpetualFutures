@@ -24,33 +24,69 @@ def _fetch_ohlcv_deribit(instrument_name, start_date, end_date, timeframe="1h", 
     # Deribit uses unix timestamps in ms
     since = int(pd.to_datetime(start_date).timestamp() * 1000)
     end_ts = int(pd.to_datetime(end_date).timestamp() * 1000)
-    all_rows = []
-    while since < end_ts:
+    resolution = 60 if timeframe == "1h" else timeframe
+    all_dfs = []
+    fetch_end = end_ts
+    max_loops = 10000  # safety to avoid infinite loop
+    loops = 0
+    print(f"[DEBUG] Requested range: {pd.to_datetime(since, unit='ms', utc=True)} to {pd.to_datetime(fetch_end, unit='ms', utc=True)}")
+    while fetch_end > since and loops < max_loops:
+        # Always fetch up to limit candles ending at fetch_end
         params = {
             "instrument_name": instrument_name,
-            "start_timestamp": since,
-            "end_timestamp": end_ts,
-            "resolution": 3600,  # 1h in seconds
+            "start_timestamp": since,  # Deribit ignores this if range is too wide, but required
+            "end_timestamp": fetch_end,
+            "resolution": resolution,
             "limit": limit
         }
+        print(f"[DEBUG] Loop {loops+1}: fetch_end={pd.to_datetime(fetch_end, unit='ms', utc=True)}")
+        print(f"[DEBUG] Request params: {params}")
         resp = requests.get(DERIBIT_API_URL + "get_tradingview_chart_data", params=params)
+        if resp.status_code != 200:
+            print(f"Deribit API error: {resp.status_code}")
+            break
         data = resp.json()
-        if not data.get("result") or not data["result"].get("ticks"):
+        result = data.get("result", {})
+        required_fields = ["ticks", "open", "high", "low", "close", "volume"]
+        if not all(field in result for field in required_fields):
+            print("Missing fields in Deribit response, stopping batch fetch.")
             break
-        ticks = data["result"]["ticks"]
-        for t in ticks:
-            if t[0] > end_ts:
-                continue
-            all_rows.append(t)
-        if len(ticks) < limit:
+        if not result["ticks"]:
+            print("No more data returned from Deribit, stopping batch fetch.")
             break
-        since = ticks[-1][0] + 1
-        time.sleep(0.2)
-    if not all_rows:
+        print(f"[DEBUG] Received {len(result['ticks'])} rows, first: {pd.to_datetime(result['ticks'][0], unit='ms', utc=True)}, last: {pd.to_datetime(result['ticks'][-1], unit='ms', utc=True)}")
+        df = pd.DataFrame({
+            "timestamp": result["ticks"],
+            "open": result["open"],
+            "high": result["high"],
+            "low": result["low"],
+            "close": result["close"],
+            "volume": result["volume"]
+        })
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("timestamp")
+        all_dfs.append(df)
+        # If we received less than limit, we've reached the oldest available data
+        if len(df) < limit:
+            print(f"[DEBUG] Received less than limit ({limit}), breaking loop.")
+            break
+        # Otherwise, move fetch_end to the oldest timestamp in this batch minus 1ms
+        oldest_ts = int(df.index[0].timestamp() * 1000)
+        if oldest_ts >= fetch_end:
+            print(f"[DEBUG] oldest_ts >= fetch_end ({oldest_ts} >= {fetch_end}), breaking loop to avoid infinite loop.")
+            break
+        fetch_end = oldest_ts - 1
+        loops += 1
+        time.sleep(0.1)  # be gentle to API
+    if not all_dfs:
+        print("[DEBUG] No dataframes collected, returning empty DataFrame.")
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp")
+    # Concatenate in reverse (oldest first)
+    df = pd.concat(all_dfs[::-1])
+    df = df[~df.index.duplicated(keep="first")]
+    # Filter to requested range (API may overshoot)
+    df = df[(df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))]
+    print(f"[DEBUG] Final dataframe shape: {df.shape}, first index: {df.index[0] if not df.empty else None}, last index: {df.index[-1] if not df.empty else None}")
     # Derive bid/ask from close if no historical L2 available
     half_spread = spread_bps / 10_000
     df["best_bid_deribit"] = df["close"] * (1 - half_spread)
@@ -97,6 +133,16 @@ def fetch_deribit(
     print(f"{'='*55}")
     print("\n[1/3] Perp OHLCV...")
     perp_ohlcv = _fetch_ohlcv_deribit(perp_symbol, start_date, end_date, timeframe, spread_bps=spread_bps)
+    if perp_ohlcv.empty:
+        print("No OHLCV data returned from Deribit for the given parameters.")
+        # Return an empty DataFrame with the expected columns for downstream compatibility
+        idx = pd.date_range(start=start_date, end=end_date, freq="1h", tz="UTC")
+        df = pd.DataFrame(index=idx, columns=[
+            "mark_price_deribit", "best_bid_deribit", "best_ask_deribit",
+            "funding_rate_raw_deribit", "open_interest_usd_deribit"
+        ])
+        df.index.name = "timestamp"
+        return df
     print("\n[2/3] Funding rates...")
     funding = _fetch_funding_rates_deribit(perp_symbol, start_date, end_date)
     print("\n[3/3] Open interest...")
@@ -109,3 +155,108 @@ def fetch_deribit(
     df = df.sort_index()
     print(f"\n✅ Done — {len(df)} rows assembled.")
     return df
+
+import requests
+import pandas as pd
+import time
+from datetime import datetime, timezone, timedelta
+
+DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
+
+DERIBIT_SYMBOLS = {
+    "BTC": "BTC-PERPETUAL",
+    "ETH": "ETH-PERPETUAL",
+    "SOL": "SOL-PERPETUAL",
+}
+
+def fetch_deribit_funding_df(
+    asset: str      = "BTC",
+    start_date: str = "2020-01-01",
+    end_date: str   = "2024-01-01",
+    chunk_days: int = 30,
+    sleep_s: float  = 0.3,
+) -> pd.DataFrame:
+    """
+    Fetches Deribit hourly funding rate history and returns a DataFrame
+    ready to merge with your main df on the timestamp index.
+
+    Returns
+    -------
+    pd.DataFrame with:
+        index   : timestamp (UTC, hourly)
+        columns : funding_rate_raw_deribit (float)
+
+    Merge with your main df
+    -----------------------
+        df = df.join(fetch_deribit_funding_df("BTC", ...), how="left")
+    """
+    instrument = DERIBIT_SYMBOLS.get(asset.upper())
+    if not instrument:
+        raise ValueError(f"Unknown asset '{asset}'. Available: {list(DERIBIT_SYMBOLS.keys())}")
+
+    start_dt = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    end_dt   = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+    chunk    = timedelta(days=chunk_days)
+
+    # ── Paginate through chunks ───────────────────────────────────────────────
+    all_rows = []
+    cursor   = start_dt
+
+    print(f"\nFetching Deribit funding — {instrument} | {start_date} → {end_date}")
+
+    while cursor < end_dt:
+        window_end = min(cursor + chunk, end_dt)
+
+        params = {
+            "instrument_name": instrument,
+            "start_timestamp": int(cursor.timestamp() * 1000),
+            "end_timestamp":   int(window_end.timestamp() * 1000),
+        }
+        resp = requests.get(
+            f"{DERIBIT_BASE}/get_funding_rate_history",
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "error" in data:
+            raise RuntimeError(f"Deribit API error: {data['error']}")
+
+        batch = data.get("result", [])
+        all_rows.extend(batch)
+        print(f"  {cursor.date()} → {window_end.date()} | rows: {len(batch)} | total: {len(all_rows)}")
+
+        cursor = window_end
+        time.sleep(sleep_s)
+
+    if not all_rows:
+        raise RuntimeError("No data returned — check instrument name and date range.")
+
+    # ── Build clean hourly DataFrame ──────────────────────────────────────────
+    raw = pd.DataFrame(all_rows)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
+    raw = raw.set_index("timestamp").sort_index()
+
+    # Enforce a clean hourly grid — gaps become explicit NaN
+    full_index = pd.date_range(
+        start = raw.index.min(),
+        end   = raw.index.max(),
+        freq  = "1h",
+        tz    = "UTC",
+    )
+
+    df_out = (
+        raw["interest_1h"]
+        .reindex(full_index)
+        .rename("funding_rate_raw_deribit")
+        .rename_axis("timestamp")
+        .to_frame()
+    )
+
+    n_gaps = df_out["funding_rate_raw_deribit"].isna().sum()
+    if n_gaps > 0:
+        print(f"⚠️  {n_gaps} NaN rows — genuine API gaps.")
+
+    print(f"\n✅ Done — {len(df_out)} hourly rows.")
+    return df_out
