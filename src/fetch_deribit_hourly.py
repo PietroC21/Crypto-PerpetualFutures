@@ -1,31 +1,32 @@
 import requests
 import pandas as pd
-import numpy as np
 import time
+import numpy as np
 from datetime import datetime, timezone, timedelta
 
-# ── CONSTANTS ────────────────────────────────────────────────────────────────
-
-DERIBIT_API_URL = "https://www.deribit.com/api/v2/public"
-
+# ── EXCHANGE CONSTANTS ───────────────────────────────────────────────────────
 EXCHANGE_CONSTANTS = {
     "deribit": {
         "funding_interval_hours": 8,
-        "perp_taker_fee_bps":     5.0,
-        "spot_taker_fee_bps":     None,   # no spot market on Deribit
+        "perp_taker_fee_bps": 3.0,   # Deribit taker: 0.03% for BTC/ETH inverse, 0.05% for linear
+        "spot_taker_fee_bps": None,   # no spot market on Deribit
     }
 }
 
-# Correct instrument names — BTC/ETH are inverse, rest are linear USDC-settled
+# Correct instrument names — BTC/ETH are inverse, rest are USDC-settled linear
 DERIBIT_SYMBOLS = {
-    "BTC":  ("BTC-PERPETUAL",       "inverse"),   # margined in BTC
-    "ETH":  ("ETH-PERPETUAL",       "inverse"),   # margined in ETH
-    "SOL":  ("SOL_USDC-PERPETUAL",  "linear"),
-    "XRP":  ("XRP_USDC-PERPETUAL",  "linear"),
-    "BNB":  ("BNB_USDC-PERPETUAL",  "linear"),    # only since June 2025 — early rows will be NaN
-    "AVAX": ("AVAX_USDC-PERPETUAL", "linear"),
-    "DOGE": ("DOGE_USDC-PERPETUAL", "linear"),
+    "BTC":  "BTC-PERPETUAL",           # inverse — margined in BTC
+    "ETH":  "ETH-PERPETUAL",           # inverse — margined in ETH
+    "SOL":  "SOL_USDC-PERPETUAL",      # linear  — margined in USDC
+    "XRP":  "XRP_USDC-PERPETUAL",      # linear  — margined in USDC
+    "BNB":  "BNB_USDC-PERPETUAL",      # linear  — only available since June 2025
+    "AVAX": "AVAX_USDC-PERPETUAL",     # linear  — margined in USDC
+    "DOGE": "DOGE_USDC-PERPETUAL",     # linear  — margined in USDC
 }
+
+# Inverse contracts: price quoted in USD but margined/settled in the base coin
+# Funding rate must be multiplied by mark_price to get USD-equivalent rate
+INVERSE_ASSETS = {"BTC", "ETH"}
 
 # Per-asset spread assumptions in bps (half-spread applied symmetrically)
 SPREAD_BPS: dict[str, float] = {
@@ -38,38 +39,41 @@ SPREAD_BPS: dict[str, float] = {
     "DOGE": 7.0,
 }
 
+DERIBIT_API_URL = "https://www.deribit.com/api/v2/public"
 
-# ── INTERNAL: OHLCV ──────────────────────────────────────────────────────────
+
+# ── HELPERS ──────────────────────────────────────────────────────────────────
+def _to_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
 
 def _fetch_ohlcv_deribit(
     instrument_name: str,
+    asset: str,
     start_date: str,
     end_date: str,
-    asset: str,
-    contract_type: str,         # "inverse" or "linear"
     timeframe: str = "1h",
     limit: int = 1000,
 ) -> pd.DataFrame:
     """
-    Fetches OHLCV from Deribit and returns a clean hourly DataFrame.
+    Fetches OHLCV from Deribit for a given instrument.
 
-    For inverse contracts (BTC, ETH): close price is in USD index terms from
-    the API, but PnL is in coin. We keep prices in USD and flag the type.
+    For inverse contracts (BTC, ETH):
+        - Raw close is in USD (price of 1 BTC/ETH in USD) — no conversion needed
+          for mark_price, best_bid, best_ask (already USD-denominated)
 
-    Derives best_bid / best_ask from close using per-asset SPREAD_BPS.
+    Returns columns: open, high, low, close, volume
+    All prices are in USD regardless of margin currency.
     """
-    spread_bps  = SPREAD_BPS.get(asset.upper(), 5.0)
-    half_spread = spread_bps / 10_000
-    resolution  = 60 if timeframe == "1h" else int(timeframe)
+    since    = _to_ms(pd.to_datetime(start_date, utc=True))
+    end_ts   = _to_ms(pd.to_datetime(end_date,   utc=True))
+    resolution = 60 if timeframe == "1h" else int(timeframe)
 
-    since    = int(pd.Timestamp(start_date, tz="UTC").timestamp() * 1000)
-    end_ts   = int(pd.Timestamp(end_date,   tz="UTC").timestamp() * 1000)
+    all_dfs  = []
     fetch_end = end_ts
-    all_dfs   = []
-    loops     = 0
+    loops    = 0
 
-    print(f"  [{instrument_name}] OHLCV {pd.Timestamp(since, unit='ms', utc=True).date()} "
-          f"→ {pd.Timestamp(end_ts, unit='ms', utc=True).date()}")
+    print(f"  Fetching OHLCV for {instrument_name}...")
 
     while fetch_end > since and loops < 10_000:
         params = {
@@ -79,170 +83,63 @@ def _fetch_ohlcv_deribit(
             "resolution":      resolution,
             "limit":           limit,
         }
-        try:
-            resp = requests.get(f"{DERIBIT_API_URL}/get_tradingview_chart_data",
-                                params=params, timeout=10)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  ⚠️  Request failed: {e} — stopping pagination.")
-            break
-
+        resp = requests.get(f"{DERIBIT_API_URL}/get_tradingview_chart_data", params=params, timeout=10)
+        resp.raise_for_status()
         result = resp.json().get("result", {})
+
         required = ["ticks", "open", "high", "low", "close", "volume"]
-        if not all(k in result for k in required) or not result["ticks"]:
-            print("  No more data — stopping pagination.")
+        if not all(f in result for f in required) or not result["ticks"]:
             break
 
         df = pd.DataFrame({
             "timestamp": pd.to_datetime(result["ticks"], unit="ms", utc=True),
-            "open":      result["open"],
-            "high":      result["high"],
-            "low":       result["low"],
-            "close":     result["close"],
-            "volume":    result["volume"],
+            "open":   result["open"],
+            "high":   result["high"],
+            "low":    result["low"],
+            "close":  result["close"],
+            "volume": result["volume"],
         }).set_index("timestamp")
 
         all_dfs.append(df)
+        print(f"    {df.index[0]} → {df.index[-1]} | rows: {len(df)} | total: {sum(len(d) for d in all_dfs)}")
 
         if len(df) < limit:
             break
 
-        oldest_ts = int(df.index[0].timestamp() * 1000)
+        oldest_ts = _to_ms(df.index[0])
         if oldest_ts >= fetch_end:
             break
         fetch_end = oldest_ts - 1
         loops += 1
-        time.sleep(0.1)
+        time.sleep(0.15)
 
-    # ── Return NaN frame if nothing fetched (e.g. BNB before June 2025) ──────
     if not all_dfs:
-        print(f"  ⚠️  No OHLCV data for {instrument_name} in this range — filling with NaN.")
-        idx = pd.date_range(start=start_date, end=end_date, freq="1h", tz="UTC")
-        return pd.DataFrame(
-            index=idx,
-            data={
-                "mark_price_deribit":   np.nan,
-                "best_bid_deribit":     np.nan,
-                "best_ask_deribit":     np.nan,
-                "contract_type":        contract_type,
-            }
-        )
+        return pd.DataFrame()
 
-    df = (pd.concat(all_dfs[::-1])
-            .pipe(lambda x: x[~x.index.duplicated(keep="first")])
-            .sort_index())
-
-    # Clip to requested range
-    df = df.loc[
-        (df.index >= pd.Timestamp(start_date, tz="UTC")) &
-        (df.index <= pd.Timestamp(end_date,   tz="UTC"))
+    df = pd.concat(all_dfs[::-1])
+    df = df[~df.index.duplicated(keep="first")].sort_index()
+    df = df[
+        (df.index >= pd.to_datetime(start_date, utc=True)) &
+        (df.index <= pd.to_datetime(end_date,   utc=True))
     ]
-
-    # ── For inverse contracts: close from Deribit is already the USD mark price
-    # (Deribit quotes BTC-PERPETUAL in USD). No conversion needed for the price
-    # itself. The funding rate IS what needs USD conversion (done separately).
-    df["mark_price_deribit"] = df["close"]
-    df["best_bid_deribit"]   = df["close"] * (1 - half_spread)
-    df["best_ask_deribit"]   = df["close"] * (1 + half_spread)
-    df["contract_type"]      = contract_type
-
-    print(f"  ✅ {len(df)} rows | spread: ±{spread_bps} bps | type: {contract_type}")
-    return df[["mark_price_deribit", "best_bid_deribit", "best_ask_deribit", "contract_type"]]
+    return df
 
 
-# ── INTERNAL: FUNDING RATES ──────────────────────────────────────────────────
-
-def _fetch_funding_rates_deribit(
-    instrument_name: str,
-    asset: str,
-    contract_type: str,
-    start_date: str,
-    end_date: str,
-    mark_price: pd.Series,      # needed for inverse USD conversion
-    chunk_days: int = 30,
-    sleep_s: float  = 0.3,
-) -> pd.Series:
-    """
-    Fetches funding rate history from Deribit.
-
-    For LINEAR contracts: returns interest_1h directly (already in % of notional USD).
-    For INVERSE contracts: funding is paid in BTC/ETH. We convert to USD-equivalent
-    using the mark price: funding_usd_rate = interest_1h × mark_price_at_settlement.
-    This makes it directly comparable to linear funding rates for cross-asset analysis.
-
-    Returns pd.Series named 'funding_rate_raw_deribit', indexed by UTC timestamp.
-    NaN where data is unavailable (e.g. BNB before June 2025).
-    """
-    start_dt = datetime.fromisoformat(start_date.replace("Z", "")).replace(tzinfo=timezone.utc)
-    end_dt   = datetime.fromisoformat(end_date.replace("Z", "")).replace(tzinfo=timezone.utc)
-    chunk    = timedelta(days=chunk_days)
-    all_rows = []
-    cursor   = start_dt
-
-    while cursor < end_dt:
-        window_end = min(cursor + chunk, end_dt)
-        params = {
-            "instrument_name": instrument_name,
-            "start_timestamp": int(cursor.timestamp() * 1000),
-            "end_timestamp":   int(window_end.timestamp() * 1000),
-        }
-        try:
-            resp = requests.get(f"{DERIBIT_API_URL}/get_funding_rate_history",
-                                params=params, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as e:
-            print(f"  ⚠️  Funding fetch failed for chunk {cursor.date()}: {e}")
-            cursor = window_end
-            time.sleep(sleep_s)
-            continue
-
-        if "error" in data:
-            print(f"  ⚠️  API error for {instrument_name}: {data['error']} — chunk skipped.")
-            cursor = window_end
-            time.sleep(sleep_s)
-            continue
-
-        batch = data.get("result", [])
-        all_rows.extend(batch)
-        print(f"  [funding] {cursor.date()} → {window_end.date()} | rows: {len(batch)} | total: {len(all_rows)}")
-        cursor = window_end
-        time.sleep(sleep_s)
-
-    # ── Build clean hourly grid ───────────────────────────────────────────────
-    full_index = pd.date_range(start=start_date, end=end_date, freq="1h", tz="UTC")
-
-    if not all_rows:
-        print(f"  ⚠️  No funding data for {instrument_name} — filling with NaN.")
-        return pd.Series(np.nan, index=full_index, name="funding_rate_raw_deribit")
-
-    raw = pd.DataFrame(all_rows)
-    raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
-    raw = raw.set_index("timestamp").sort_index()
-
-    series = raw["interest_1h"].reindex(full_index)
-
-    # ── Inverse: convert coin-denominated rate to USD-equivalent ─────────────
-    # funding_usd_equivalent = interest_1h × mark_price
-    # e.g. 0.0001 BTC per BTC notional × $50,000/BTC = $5 per $50,000 = 0.0001 USD rate
-    # The ratio stays the same! For inverse perps:
-    # interest_1h is already dimensionless (fraction of notional) so the USD
-    # rate equals interest_1h directly — no conversion needed for the RATE.
-    # What differs is margin currency, not the rate itself.
-    # We flag this clearly but do not transform the value.
-    if contract_type == "inverse":
-        print(f"  ℹ️  {asset} is inverse — funding rate is dimensionless fraction, "
-              f"comparable to linear. Margin is in {asset}, not USD.")
-
-    n_gaps = series.isna().sum()
-    if n_gaps > 0:
-        print(f"  ⚠️  {n_gaps} NaN rows in funding series.")
-
-    return series.rename("funding_rate_raw_deribit")
+def _fetch_funding_chunk_deribit(instrument: str, start_dt: datetime, end_dt: datetime) -> list:
+    params = {
+        "instrument_name": instrument,
+        "start_timestamp": _to_ms(start_dt),
+        "end_timestamp":   _to_ms(end_dt),
+    }
+    resp = requests.get(f"{DERIBIT_API_URL}/get_funding_rate_history", params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"Deribit API error: {data['error']}")
+    return data.get("result", [])
 
 
 # ── PUBLIC FUNCTION ───────────────────────────────────────────────────────────
-
 def fetch_deribit(
     asset: str      = "BTC",
     start_date: str = "2020-01-01T00:00:00Z",
@@ -252,73 +149,123 @@ def fetch_deribit(
     sleep_s: float  = 0.3,
 ) -> pd.DataFrame:
     """
-    Fetches and assembles a clean hourly dataframe for one asset on Deribit.
+    Fetches and assembles a clean hourly Deribit dataframe for one asset.
 
     Columns returned
     ----------------
-        mark_price_deribit        — USD mark price (all contract types)
-        best_bid_deribit          — close × (1 − spread_bps/10000)
-        best_ask_deribit          — close × (1 + spread_bps/10000)
-        funding_rate_raw_deribit  — hourly funding rate (interest_1h)
-        open_interest_usd_deribit — NaN (no public historical OI API on Deribit)
-        contract_type             — 'inverse' or 'linear' (informational)
+    mark_price_deribit        — USD price of the perp (USD for all assets)
+    best_bid_deribit          — mark_price × (1 − spread/10000)
+    best_ask_deribit          — mark_price × (1 + spread/10000)
+    funding_rate_raw_deribit  — interest_1h as published (dimensionless rate)
+    funding_rate_usd_deribit  — funding_rate_raw × mark_price
+                                For linear (USDC) contracts this equals funding_rate_raw
+                                (already USD-per-USD-notional).
+                                For inverse (BTC/ETH) contracts the raw rate is per-coin-notional;
+                                multiplying by mark_price converts to USD-per-USD-notional,
+                                making it directly comparable across all assets.
 
     Notes
     -----
-    - BNB rows before June 2025 will be NaN (instrument did not exist).
-    - BTC/ETH are inverse contracts — funding rate is dimensionless and
-      directly comparable to linear rates numerically, but margin is in coin.
+    - BNB history only exists from June 2025. Earlier rows are NaN — no crash.
+    - BTC/ETH are inverse contracts but prices are quoted in USD throughout,
+      so best_bid/best_ask are already in USD. Only the funding rate needs conversion.
+    - No open_interest column: Deribit does not expose historical OI via public API.
     - spread_bps is asset-specific (see SPREAD_BPS dict).
-    - No spot market exists on Deribit — spot_best_bid/ask columns are absent.
+
+    Parameters
+    ----------
+    asset       : ticker, e.g. 'BTC', 'ETH', 'SOL'
+    start_date  : ISO8601 string
+    end_date    : ISO8601 string
+    timeframe   : candle resolution, default '1h'
+    chunk_days  : days per funding rate API chunk
+    sleep_s     : pause between API requests
     """
-    if asset.upper() not in DERIBIT_SYMBOLS:
+    asset_upper  = asset.upper()
+    instrument   = DERIBIT_SYMBOLS.get(asset_upper)
+    spread_bps   = SPREAD_BPS.get(asset_upper, 5.0)
+    is_inverse   = asset_upper in INVERSE_ASSETS
+    half_spread  = spread_bps / 10_000
+
+    if not instrument:
         raise ValueError(f"Unknown asset '{asset}'. Available: {list(DERIBIT_SYMBOLS.keys())}")
 
-    instrument, contract_type = DERIBIT_SYMBOLS[asset.upper()]
-
     print(f"\n{'='*55}")
-    print(f"Fetching Deribit — {asset} ({instrument}) | {start_date[:10]} → {end_date[:10]}")
-    print(f"Contract type: {contract_type} | Spread: ±{SPREAD_BPS.get(asset.upper(), 5.0)} bps")
+    print(f"Fetching Deribit — {asset} ({instrument})")
+    print(f"Range     : {start_date} → {end_date}")
+    print(f"Spread    : ±{spread_bps} bps  |  Inverse: {is_inverse}")
     print(f"{'='*55}")
 
-    # ── 1. OHLCV ─────────────────────────────────────────────────────────────
-    print("\n[1/3] Perp OHLCV...")
-    ohlcv = _fetch_ohlcv_deribit(
-        instrument, start_date, end_date,
-        asset=asset, contract_type=contract_type,
-        timeframe=timeframe,
+    # ── Full hourly index — all gaps will be explicit NaN ─────────────────────
+    full_index = pd.date_range(
+        start = start_date,
+        end   = end_date,
+        freq  = "1h",
+        tz    = "UTC",
+        inclusive = "left",
     )
-
-    # ── 2. Funding rates ──────────────────────────────────────────────────────
-    print("\n[2/3] Funding rates...")
-    funding = _fetch_funding_rates_deribit(
-        instrument, asset, contract_type,
-        start_date, end_date,
-        mark_price=ohlcv["mark_price_deribit"],
-        chunk_days=chunk_days,
-        sleep_s=sleep_s,
-    )
-
-    # ── 3. Open interest — not available, fill NaN ────────────────────────────
-    print("\n[3/3] Open interest — not available via public API, filling NaN.")
-    oi = pd.Series(
-        np.nan,
-        index=pd.date_range(start=start_date, end=end_date, freq="1h", tz="UTC"),
-        name="open_interest_usd_deribit",
-    )
-
-    # ── Assemble ──────────────────────────────────────────────────────────────
-    df = ohlcv.copy()
-    df = df.join(funding.to_frame(),  how="left")
-    df = df.join(oi.to_frame(),       how="left")
-
+    df = pd.DataFrame(index=full_index)
     df.index.name = "timestamp"
-    df = df.sort_index()
 
-    n_nan = df["mark_price_deribit"].isna().sum()
-    if n_nan > 0:
-        print(f"\n⚠️  {n_nan} NaN rows in mark_price "
-              f"({n_nan / len(df):.1%} of range) — expected for BNB before June 2025.")
+    # ── [1/2] OHLCV ──────────────────────────────────────────────────────────
+    print("\n[1/2] Perp OHLCV...")
+    ohlcv = _fetch_ohlcv_deribit(instrument, asset_upper, start_date, end_date, timeframe)
 
-    print(f"\n✅ Done — {len(df)} rows | {df['mark_price_deribit'].notna().sum()} non-NaN price rows.")
+    if ohlcv.empty:
+        print(f"  ⚠️  No OHLCV data returned — filling all price columns with NaN.")
+        df["mark_price_deribit"] = np.nan
+        df["best_bid_deribit"]   = np.nan
+        df["best_ask_deribit"]   = np.nan
+    else:
+        # Reindex onto clean hourly grid — missing candles become NaN
+        ohlcv = ohlcv.reindex(full_index)
+        df["mark_price_deribit"] = ohlcv["close"]
+        df["best_bid_deribit"]   = ohlcv["close"] * (1 - half_spread)
+        df["best_ask_deribit"]   = ohlcv["close"] * (1 + half_spread)
+
+    # ── [2/2] Funding rates ───────────────────────────────────────────────────
+    print("\n[2/2] Funding rate history...")
+
+    start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+    end_dt   = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+    chunk    = timedelta(days=chunk_days)
+    cursor   = start_dt
+    all_rows = []
+
+    while cursor < end_dt:
+        window_end = min(cursor + chunk, end_dt)
+        try:
+            batch = _fetch_funding_chunk_deribit(instrument, cursor, window_end)
+            all_rows.extend(batch)
+            print(f"  {cursor.date()} → {window_end.date()} | rows: {len(batch)} | total: {len(all_rows)}")
+        except Exception as e:
+            print(f"  ⚠️  Chunk {cursor.date()} failed: {e} — filling with NaN")
+        cursor = window_end
+        time.sleep(sleep_s)
+
+    if all_rows:
+        raw = pd.DataFrame(all_rows)
+        raw["timestamp"] = pd.to_datetime(raw["timestamp"], unit="ms", utc=True)
+        raw = raw.set_index("timestamp").sort_index()
+
+        funding_raw = raw["interest_1h"].reindex(full_index)
+    else:
+        print(f"  ⚠️  No funding data returned — filling with NaN (expected for BNB before June 2025).")
+        funding_raw = pd.Series(np.nan, index=full_index)
+
+    df["funding_rate_raw_deribit"] = funding_raw
+
+    # ── USD-equivalent funding rate ───────────────────────────────────────────
+    # Linear (USDC) contracts: raw rate is already per-USD-notional → no change
+    # Inverse (BTC/ETH) contracts: raw rate is per-coin-notional
+    #   → multiply by mark_price to get per-USD-notional (comparable across assets)
+    if is_inverse:
+        df["funding_rate_usd_deribit"] = df["funding_rate_raw_deribit"] * df["mark_price_deribit"]
+    else:
+        df["funding_rate_usd_deribit"] = df["funding_rate_raw_deribit"]
+
+    n_nan_price   = df["mark_price_deribit"].isna().sum()
+    n_nan_funding = df["funding_rate_raw_deribit"].isna().sum()
+    print(f"\n✅ Done — {len(df)} rows | NaN prices: {n_nan_price} | NaN funding: {n_nan_funding}")
+
     return df
