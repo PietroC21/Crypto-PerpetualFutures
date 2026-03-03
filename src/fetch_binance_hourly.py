@@ -1,6 +1,43 @@
+"""src/fetch_binance_hourly.py
+Fetch hourly perp data from Binance.
+
+Output columns (_binance suffix):
+    mark_price_binance       — perp mark price (close of 1h candle)
+    best_bid_binance         — derived: mark × (1 − spread_bps/10000)
+    best_ask_binance         — derived: mark × (1 + spread_bps/10000)
+    spot_best_bid_binance    — spot close × (1 − spread_bps/10000)
+    spot_best_ask_binance    — spot close × (1 + spread_bps/10000)
+    funding_rate_raw_binance — raw 8h funding rate, ffilled across hourly rows
+
+API constraints
+---------------
+  perp OHLCV  : /fapi/v1/klines — full history, 1 500 rows per call, paginated.
+  spot OHLCV  : /api/v3/klines  — same limits.
+  funding     : /fapi/v1/fundingRate — full history, 1 000 rows per call, paginated.
+                8h settlement (Binance settles at 00:00 / 08:00 / 16:00 UTC).
+                Funding rate is forward-filled across the 8 hourly rows between
+                settlements (no lookahead bias).
+
+Exchange constants
+------------------
+    funding_interval_hours : 8
+    perp_taker_fee_bps     : 5.0
+    spot_taker_fee_bps     : 10.0
+
+Note: Binance API blocks US IPs (HTTP 451). A non-US VPN is required.
+
+Usage
+-----
+    from src.fetch_binance_hourly import fetch_binance
+
+    df = fetch_binance("BTC", "2020-01-01T00:00:00Z", "2026-03-01T00:00:00Z")
+    df.to_parquet("data/BTC/binance_BTC_2020-01-01_2026-03-01.parquet")
+"""
+
 import ccxt
 import pandas as pd
 import time
+from pathlib import Path
 
 # ── EXCHANGE CONSTANTS ───────────────────────────────────────────────────────
 EXCHANGE_CONSTANTS = {
@@ -196,5 +233,60 @@ def fetch_binance(
     df.index.name = "timestamp"
     df = df.sort_index()
 
-    print(f"\n✅ Done — {len(df)} rows assembled.")
+    n_funding = df["funding_rate_raw_binance"].notna().sum()
+    n_ohlcv   = df["mark_price_binance"].notna().sum()
+    print(f"\nDone — {len(df):,} rows total")
+    print(f"   OHLCV rows    : {n_ohlcv:,}")
+    print(f"   Funding rows  : {n_funding:,}")
+    print(f"   Null funding  : {df['funding_rate_raw_binance'].isna().sum():,}")
     return df
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    UNIVERSE = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "AVAX"]
+
+    parser = argparse.ArgumentParser(
+        description="Fetch Binance hourly perp data for one or all universe assets."
+    )
+    parser.add_argument("--asset",  default=None,
+                        help="Single coin ticker, e.g. BTC. Omit to fetch all 7.")
+    parser.add_argument("--start",  default="2020-01-01T00:00:00Z",
+                        help="Start date ISO-8601 UTC (default: 2020-01-01)")
+    parser.add_argument("--end",    default="2026-03-01T00:00:00Z",
+                        help="End date ISO-8601 UTC (default: 2026-03-01)")
+    parser.add_argument("--spread", type=float, default=2.0,
+                        help="Half-spread in bps (default: 2.0)")
+    args = parser.parse_args()
+
+    assets     = [args.asset] if args.asset else UNIVERSE
+    start_slug = args.start[:10]
+    end_slug   = args.end[:10]
+
+    failed = []
+    for asset in assets:
+        try:
+            df = fetch_binance(
+                asset=asset,
+                start_date=args.start,
+                end_date=args.end,
+                spread_bps=args.spread,
+            )
+            out_dir = Path("data") / asset
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"binance_{asset}_{start_slug}_{end_slug}.parquet"
+            df.to_parquet(out_path)
+            print(f"Saved → {out_path}\n")
+        except Exception as exc:
+            print(f"[ERROR] {asset}: {exc}")
+            failed.append(asset)
+
+    if failed:
+        print(f"\nFailed assets: {failed}")
+    else:
+        print(f"\nAll {len(assets)} assets saved to data/{{ASSET}}/")
