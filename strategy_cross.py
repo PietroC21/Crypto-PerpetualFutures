@@ -90,6 +90,14 @@ ASSET_MAP: dict[str, str] = {
 DEFAULTS_CROSS: dict = {
     "z_lookback":     270,      # periods (270 × 8h ≈ 90 days)
     "z_entry":        2.0,      # |z| threshold to enter a position
+    "z_exit":         0.0,      # |z| threshold to EXIT a position (hysteresis band).
+    #   Must be ≤ z_entry.  Setting z_exit = z_entry replicates the old
+    #   period-by-period behaviour (exit as soon as z drops below entry).
+    #   Setting z_exit = 0.0 keeps a position until the z-score fully reverts,
+    #   dramatically reducing turnover and fee drag.
+    "min_hold":       3,        # minimum number of 8h periods to hold before exiting.
+    #   Prevents immediate exit after entry even if z reverts quickly.
+    #   Works in addition to z_exit: both conditions must allow exit.
     "oi_lookback":    270,      # periods for OI rolling mean
     "oi_min_ratio":   0.5,      # OI must be ≥ 50 % of rolling mean
     "vix_gate":       30.0,     # VIX level above which we go flat
@@ -379,19 +387,67 @@ def run_backtest_cross(
         params["spy_dd_gate"],
     )
 
-    # --- Positions ---
+    # --- Positions (hysteresis entry/exit band) ---
     # Direction is constrained by the SIGN of best_fr to guarantee we always
     # collect the funding rate rather than pay it:
-    #   best_fr > 0 (contango)    → only SHORT allowed (z > +entry)
-    #   best_fr < 0 (backwardation) → only LONG  allowed (z < -entry)
-    # Without this check, z < -entry with a still-positive best_fr would trigger
-    # a LONG position that pays the positive funding rate — the wrong direction.
-    z_entry = params["z_entry"]
-    raw = pd.DataFrame(0.0, index=zscore.index, columns=zscore.columns)
-    raw[(zscore >  z_entry) & (best_fr > 0)] = -1.0  # contango → short perp
-    raw[(zscore < -z_entry) & (best_fr < 0)] =  1.0  # backwardation → long perp
+    #   best_fr > 0 (contango)    → only SHORT allowed (z > +z_entry)
+    #   best_fr < 0 (backwardation) → only LONG  allowed (z < -z_entry)
+    #
+    # Hysteresis: enter when |z| crosses z_entry, hold until |z| drops below
+    # z_exit AND min_hold periods have elapsed.  This prevents the old behaviour
+    # where any single-period dip below z_entry immediately closed the trade,
+    # generating constant turnover and fee drag on very short-lived positions.
+    z_entry  = params["z_entry"]
+    z_exit   = params["z_exit"]
+    min_hold = params["min_hold"]
 
-    # Apply OI and macro filters
+    z_arr  = zscore.values          # (T, N)
+    fr_arr = best_fr.reindex(zscore.index).values  # (T, N)
+    raw_arr = np.zeros_like(z_arr)
+    hold_arr = np.zeros(z_arr.shape[1], dtype=int)  # periods held per asset
+
+    for t in range(1, len(z_arr)):
+        for n in range(z_arr.shape[1]):
+            prev   = raw_arr[t - 1, n]
+            zv     = z_arr[t, n]
+            frv    = fr_arr[t, n]
+            hc     = hold_arr[n]
+
+            if np.isnan(zv) or np.isnan(frv):
+                raw_arr[t, n] = 0.0
+                hold_arr[n]   = 0
+                continue
+
+            if prev == 0.0:
+                # No position — check entry conditions
+                if zv > z_entry and frv > 0:
+                    raw_arr[t, n] = -1.0   # contango → short perp
+                    hold_arr[n]   = 1
+                elif zv < -z_entry and frv < 0:
+                    raw_arr[t, n] = 1.0    # backwardation → long perp
+                    hold_arr[n]   = 1
+                else:
+                    raw_arr[t, n] = 0.0
+                    hold_arr[n]   = 0
+            else:
+                # In position — exit only if min_hold elapsed AND z has reverted.
+                # Direction-aware: short exits when z < z_exit (contango unwound),
+                # long exits when z > -z_exit (backwardation unwound).
+                if prev < 0:
+                    z_reverted = zv < z_exit
+                else:
+                    z_reverted = zv > -z_exit
+                can_exit = hc >= min_hold and z_reverted
+                if can_exit:
+                    raw_arr[t, n] = 0.0
+                    hold_arr[n]   = 0
+                else:
+                    raw_arr[t, n] = prev
+                    hold_arr[n]   = hc + 1
+
+    raw = pd.DataFrame(raw_arr, index=zscore.index, columns=zscore.columns)
+
+    # Apply OI and macro filters — force flat when either fires
     raw = raw * oi_mask.reindex_like(raw).fillna(True).astype(float)
     raw = raw.multiply(risk_on.reindex(raw.index).fillna(True).astype(float), axis=0)
 
