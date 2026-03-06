@@ -46,7 +46,7 @@ OB_DATA_DIR = Path(__file__).resolve().parent / "data" / "raw" / "binance" / "or
 
 DEFAULTS: dict = {
     "z_lookback":     270,   # periods (270 × 8h ≈ 90 days)
-    "z_entry":        1.6,   # |z| threshold to enter a position
+    "z_entry":        1.5,   # |z| threshold to enter a position
     "oi_lookback":    270,   # periods for OI rolling mean
     "oi_min_ratio":   0.5,   # OI must be ≥ 50% of rolling mean
     "vix_gate":       30.0,  # VIX level above which we go flat
