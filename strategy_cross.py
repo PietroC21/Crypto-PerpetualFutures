@@ -25,7 +25,7 @@ Fee model:
 
 Data requirements:
   Binance : data/processed/master_panel.parquet  (already built)
-  GateIO  : data/{ASSET}/gateio_{ASSET}_*.parquet
+  GateIO  : data/{ASSET}/gate_{ASSET}_*.parquet
   HL      : data/{ASSET}/hyperliquid_{ASSET}_*.parquet
 
 Usage
@@ -139,12 +139,16 @@ def _load_gateio_fr(data_dir: Path, universe: list[str]) -> pd.DataFrame:
         asset = ASSET_MAP.get(sym)
         if not asset:
             continue
-        paths = sorted(data_dir.glob(f"{asset}/gateio_{asset}_*.parquet"))
+        paths = sorted(data_dir.glob(f"{asset}/gate_{asset}_*.parquet"))
         if not paths:
             continue
         raw = pd.read_parquet(paths[-1])
-        ts = pd.to_datetime(raw["Timestamp"]).dt.tz_convert("UTC")
-        fr = pd.Series(raw["funding_rate_raw_gateio"].values, index=ts, name=sym)
+        ts = pd.to_datetime(raw["timestamp"])
+        if ts.dt.tz is None:
+            ts = ts.dt.tz_localize("UTC")
+        else:
+            ts = ts.dt.tz_convert("UTC")
+        fr = pd.Series(raw["funding_rate_raw_gate"].values, index=ts, name=sym)
         frames[sym] = fr.resample("8h").sum()
 
     return pd.DataFrame(frames) if frames else pd.DataFrame()
@@ -170,7 +174,7 @@ def _load_hl_fr(data_dir: Path, universe: list[str]) -> pd.DataFrame:
         if not paths:
             continue
         raw = pd.read_parquet(paths[-1])
-        fr = raw["funding_rate_raw_hyperliquid"].copy()
+        fr = raw["funding_rate_1h_hyperliquid"].copy()
         if fr.index.tz is None:
             fr.index = fr.index.tz_localize("UTC")
         else:
@@ -220,7 +224,7 @@ def compute_best_fr(
 
     exchange_data: list[tuple[str, pd.DataFrame]] = [
         ("binance",     fr_bn),
-        ("gateio",      gi),
+        ("gate",        gi),
         ("hyperliquid", hl),
     ]
 
@@ -330,7 +334,7 @@ def run_backtest_cross(
         Required columns: funding_rate, open_interest, vix_close, spy_close,
         rfr_daily_decimal.
     data_dir : str or Path
-        Root data directory containing {ASSET}/gateio_*.parquet and
+        Root data directory containing {ASSET}/gate_*.parquet and
         {ASSET}/hyperliquid_*.parquet sub-folders.
     **kwargs : override any key in DEFAULTS_CROSS
 
